@@ -312,17 +312,17 @@ class Channel(int):
         channel._service = service
         return channel
 
-    def receive_key_value(self):
-        return self._service.recv_plist(self)
+    async def receive_key_value(self):
+        return await self._service.recv_plist(self)
 
-    def receive_plist(self):
-        return self._service.recv_plist(self)[0]
+    async def receive_plist(self):
+        return (await self._service.recv_plist(self))[0]
 
-    def receive_message(self):
-        return self._service.recv_message(self)[0]
+    async def receive_message(self):
+        return (await self._service.recv_message(self))[0]
 
-    def send_message(self, selector: str, args: MessageAux = None, expects_reply: bool = True):
-        self._service.send_message(self, selector, args, expects_reply=expects_reply)
+    async def send_message(self, selector: str, args: MessageAux = None, expects_reply: bool = True):
+        await self._service.send_message(self, selector, args, expects_reply=expects_reply)
 
     @staticmethod
     def _sanitize_name(name: str):
@@ -418,9 +418,7 @@ class RemoteServer(LockdownService):
         is_developer_service: bool = True,
     ):
         super().__init__(lockdown, service_name, is_developer_service=is_developer_service)
-
-        if remove_ssl_context and hasattr(self.service.socket, "_sslobj"):
-            self.service.socket._sslobj = None
+        self._remove_ssl_context = remove_ssl_context
 
         self.lock = threading.RLock()
         self.supported_identifiers = {}
@@ -430,6 +428,29 @@ class RemoteServer(LockdownService):
         self.channel_cache = {}
         self.channel_messages = {self.BROADCAST_CHANNEL: ChannelFragmenter()}
         self.broadcast = Channel.create(0, self)
+
+    async def connect(self) -> None:
+        if self._service is None and self._remove_ssl_context:
+            if hasattr(self.lockdown, "get_service_connection_attributes") and hasattr(
+                self.lockdown, "_create_service_connection"
+            ):
+                attr = await self.lockdown.get_service_connection_attributes(
+                    self.service_name, include_escrow_bag=self._include_escrow_bag
+                )
+                self._service = await self.lockdown._create_service_connection(attr["Port"])
+                if attr.get("EnableServiceSSL", False) and hasattr(self.lockdown, "ssl_file"):
+                    # Mirror the legacy sync flow: negotiate SSL once, then strip SSL context for raw DTX traffic.
+                    with self.lockdown.ssl_file() as f:
+                        self._service.setblocking(True)
+                        self._service.ssl_start_sync(f)
+            else:
+                await super().connect()
+        else:
+            await super().connect()
+        if self._remove_ssl_context:
+            self.service._force_socket_mode = True
+            if hasattr(self.service.socket, "_sslobj"):
+                self.service.socket._sslobj = None
 
     def _log_dtx_message(self, direction: str, mheader: Container | bytes, payload: bytes) -> None:
         if not self.logger.isEnabledFor(logging.DEBUG):
@@ -479,20 +500,19 @@ class RemoteServer(LockdownService):
             },
         )
 
-    def perform_handshake(self):
+    async def perform_handshake(self):
         args = MessageAux()
         args.append_obj({"com.apple.private.DTXBlockCompression": 0, "com.apple.private.DTXConnection": 1})
 
-        with self.lock:
-            self.send_message(0, "_notifyOfPublishedCapabilities:", args, expects_reply=False)
-            ret, aux = self.recv_plist()
-            if ret != "_notifyOfPublishedCapabilities:":
-                raise ValueError("Invalid answer")
-            if not len(aux[0]):
-                raise ValueError("Invalid answer")
-            self.supported_identifiers = aux[0].value
+        await self.send_message(0, "_notifyOfPublishedCapabilities:", args, expects_reply=False)
+        ret, aux = await self.recv_plist()
+        if ret != "_notifyOfPublishedCapabilities:":
+            raise ValueError("Invalid answer")
+        if not len(aux[0]):
+            raise ValueError("Invalid answer")
+        self.supported_identifiers = aux[0].value
 
-    def make_channel(self, identifier) -> Channel:
+    async def make_channel(self, identifier) -> Channel:
         # NOTE: There is also identifier not in self.supported_identifiers
         # assert identifier in self.supported_identifiers
         with self.lock:
@@ -501,38 +521,39 @@ class RemoteServer(LockdownService):
 
             self.last_channel_code += 1
             code = self.last_channel_code
-            args = MessageAux().append_int(code).append_obj(identifier)
-            self.send_message(0, "_requestChannelWithCode:identifier:", args)
-            ret, _aux = self.recv_plist()
-            assert ret is None
-            channel = Channel.create(code, self)
+        args = MessageAux().append_int(code).append_obj(identifier)
+        await self.send_message(0, "_requestChannelWithCode:identifier:", args)
+        ret, _aux = await self.recv_plist()
+        assert ret is None
+        channel = Channel.create(code, self)
+        with self.lock:
+            if identifier in self.channel_cache:
+                return self.channel_cache[identifier]
             self.channel_cache[identifier] = channel
             self.channel_messages[code] = ChannelFragmenter()
             return channel
 
-    def serve_channel(self, identifier: str, channel: Optional[Channel] = None) -> Channel:
+    async def serve_channel(self, identifier: str, channel: Optional[Channel] = None) -> Channel:
         """acknoledge the remote part that they will find the expected identifier on the given channel"""
+        msg = await self.recv_plist(self.BROADCAST_CHANNEL)
+        assert msg[0] == "_requestChannelWithCode:identifier:", f"expected a request for a reverse channel, got: {msg}"
+        code = msg[1][0].value
+        assert channel is None or channel == code, (
+            f"expected a request for a reverse channel with channelCode:{channel}, got:{msg[1][0]}"
+        )
+        identifier = msg[1][1].value
+        assert identifier == msg[1][1].value, (
+            f"expected a request for a reverse channel with identifier:{identifier}, got:{msg[1][1].value}"
+        )
+        if channel is None:
+            channel = Channel.create(code, self)
         with self.lock:
-            msg = self.recv_plist(self.BROADCAST_CHANNEL)
-            assert msg[0] == "_requestChannelWithCode:identifier:", (
-                f"expected a request for a reverse channel, got: {msg}"
-            )
-            code = msg[1][0].value
-            assert channel is None or channel == code, (
-                f"expected a request for a reverse channel with channelCode:{channel}, got:{msg[1][0]}"
-            )
-            identifier = msg[1][1].value
-            assert identifier == msg[1][1].value, (
-                f"expected a request for a reverse channel with identifier:{identifier}, got:{msg[1][1].value}"
-            )
-            if channel is None:
-                channel = Channel.create(code, self)
             if code not in self.channel_messages:
                 self.channel_messages[code] = ChannelFragmenter()
-            self.send_reply_ack(self.BROADCAST_CHANNEL, self.cur_remote_message, None, None)
-            return channel
+        await self.send_reply_ack(self.BROADCAST_CHANNEL, self.cur_remote_message, None, None)
+        return channel
 
-    def send_message(
+    async def send_message(
         self, channel: int, selector: Optional[str] = None, args: MessageAux = None, expects_reply: bool = True
     ):
         aux = bytes(args) if args is not None else b""
@@ -556,13 +577,12 @@ class RemoteServer(LockdownService):
                 "channelCode": channel,
                 "expectsReply": int(expects_reply),
             })
-            msg = mheader + pheader + aux + sel
-            self.service.sendall(msg)
+        msg = mheader + pheader + aux + sel
+        await self.service.sendall(msg)
+        self._log_dtx_message("sent", mheader, pheader + aux + sel)
 
-            self._log_dtx_message("sent", mheader, pheader + aux + sel)
-
-    def recv_plist(self, channel: int = BROADCAST_CHANNEL):
-        data, aux = self.recv_message(channel)
+    async def recv_plist(self, channel: int = BROADCAST_CHANNEL):
+        data, aux = await self.recv_message(channel)
         if data is not None:
             try:
                 data = archiver.unarchive(data)
@@ -573,8 +593,8 @@ class RemoteServer(LockdownService):
                 self.logger.warning(f"got an invalid plist: {data[:40]}")
         return data, aux
 
-    def recv_message(self, channel: int = BROADCAST_CHANNEL):
-        packet_stream = self._recv_packet_fragments(channel)
+    async def recv_message(self, channel: int = BROADCAST_CHANNEL):
+        packet_stream = await self._recv_packet_fragments(channel)
         pheader = dtx_message_payload_header_struct.parse_stream(packet_stream)
 
         compression = (pheader.flags & 0xFF000) >> 12
@@ -599,7 +619,7 @@ class RemoteServer(LockdownService):
     #      : therefore the defragmenter shall work at the connection-level and store fragments by using this as hash: (msg.identifier, msg.conversationIndex).
     #      : please note that the 2 ends of the connection have their own message identifier counter.
 
-    def _send_reply(
+    async def _send_reply(
         self,
         channel: int,
         msg_id: int,
@@ -625,27 +645,28 @@ class RemoteServer(LockdownService):
             "expectsReply": (0),
         })
         msg = mheader + pheader + aux_bytes + payload_bytes
-        with self.lock:
-            self.service.sendall(msg)
-            self._log_dtx_message("sent", mheader, pheader + aux_bytes + payload_bytes)
+        await self.service.sendall(msg)
+        self._log_dtx_message("sent", mheader, pheader + aux_bytes + payload_bytes)
 
-    def send_reply(self, channel: int, msg_id: int, payload: Optional[object] = None, aux: Optional[MessageAux] = None):
+    async def send_reply(
+        self, channel: int, msg_id: int, payload: Optional[object] = None, aux: Optional[MessageAux] = None
+    ):
         msg_type = 0x3  # ResponseWithReturnValueInPayload
-        self._send_reply(channel, msg_id, msg_type, payload, aux)
+        await self._send_reply(channel, msg_id, msg_type, payload, aux)
 
-    def send_reply_error(
+    async def send_reply_error(
         self, channel: int, msg_id: int, payload: Optional[object] = None, aux: Optional[MessageAux] = None
     ):
         msg_type = 0x4  # DtxTypeError
-        self._send_reply(channel, msg_id, msg_type, payload, aux)
+        await self._send_reply(channel, msg_id, msg_type, payload, aux)
 
-    def send_reply_ack(
+    async def send_reply_ack(
         self, channel: int, msg_id: int, payload: Optional[object] = None, aux: Optional[MessageAux] = None
     ):
         msg_type = 0x0  # Ack
-        self._send_reply(channel, msg_id, msg_type, payload, aux)
+        await self._send_reply(channel, msg_id, msg_type, payload, aux)
 
-    def _recv_packet_fragments(self, channel: int = BROADCAST_CHANNEL):
+    async def _recv_packet_fragments(self, channel: int = BROADCAST_CHANNEL):
         while True:
             try:
                 # if we already have a message for this channel, just return it
@@ -658,33 +679,31 @@ class RemoteServer(LockdownService):
             except Empty:
                 # if no message exists for the given channel code, just keep waiting and receive new messages
                 # until the waited message queue has at least one message
+                data = await self.service.recvall(dtx_message_header_struct.sizeof())
+                mheader = dtx_message_header_struct.parse(data)
+
+                if mheader.fragmentCount > 1 and mheader.fragmentId == 0:
+                    # when reading multiple message fragments, the first fragment contains only a message header
+                    continue
+
+                chunk = await self.service.recvall(mheader.length)
+
+                # treat both as the negative and positive representation of the channel code in the response
+                # the same when performing fragmentation
+                received_channel_code = abs(mheader.channelCode)
                 with self.lock:
-                    data = self.service.recvall(dtx_message_header_struct.sizeof())
-                    mheader = dtx_message_header_struct.parse(data)
-
-                    # treat both as the negative and positive representation of the channel code in the response
-                    # the same when performing fragmentation
-                    received_channel_code = abs(mheader.channelCode)
-
                     if received_channel_code not in self.channel_messages:
                         self.channel_messages[received_channel_code] = ChannelFragmenter()
 
                     if not mheader.conversationIndex and mheader.identifier > self.cur_message:
                         self.cur_message = mheader.identifier
 
-                    if mheader.fragmentCount > 1 and mheader.fragmentId == 0:
-                        # when reading multiple message fragments, the first fragment contains only a message header
-                        continue
-
-                    self.channel_messages[received_channel_code].add_fragment(
-                        mheader, self.service.recvall(mheader.length)
-                    )
+                    self.channel_messages[received_channel_code].add_fragment(mheader, chunk)
 
     def __enter__(self):
-        self.perform_handshake()
-        return self
+        raise RuntimeError("Use async context manager: `async with ...`")
 
-    def close(self):
+    async def close(self):
         aux = MessageAux()
         codes = [code for code in self.channel_messages if code > 0]
         if codes:
@@ -693,8 +712,16 @@ class RemoteServer(LockdownService):
 
             with contextlib.suppress(OSError):
                 # ignore: OSError: [Errno 9] Bad file descriptor
-                self.send_message(self.BROADCAST_CHANNEL, "_channelCanceled:", aux, expects_reply=False)
-        super().close()
+                await self.send_message(self.BROADCAST_CHANNEL, "_channelCanceled:", aux, expects_reply=False)
+        await super().close()
+
+    async def __aenter__(self):
+        await self.connect()
+        await self.perform_handshake()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
 
 class Tap:
@@ -705,17 +732,20 @@ class Tap:
         self.channel = None
 
     def __enter__(self):
-        self.channel = self._dvt.make_channel(self._channel_name)
-        self.channel.setConfig_(MessageAux().append_obj(self._config), expects_reply=False)
-        self.channel.start(expects_reply=False)
+        raise RuntimeError("Use async context manager: `async with ...`")
 
+    async def __aenter__(self):
+        self.channel = await self._dvt.make_channel(self._channel_name)
+        await self.channel.setConfig_(MessageAux().append_obj(self._config), expects_reply=False)
+        await self.channel.start(expects_reply=False)
         # first message is just kind of an ack
-        self.channel.receive_plist()
+        await self.channel.receive_plist()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.channel.clear(expects_reply=False)
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.channel.clear(expects_reply=False)
 
-    def __iter__(self):
+    async def __aiter__(self):
         while True:
-            yield from self.channel.receive_plist()
+            for message in await self.channel.receive_plist():
+                yield message

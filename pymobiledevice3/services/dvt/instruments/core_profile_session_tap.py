@@ -1,3 +1,4 @@
+import queue
 import time
 import typing
 import uuid
@@ -31,7 +32,6 @@ from pykdebugparser.kd_buf_parser import RAW_VERSION2_BYTES
 from pymobiledevice3.exceptions import ExtractingStackshotError
 from pymobiledevice3.resources.dsc_uuid_map import get_dsc_map
 from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService
-from pymobiledevice3.services.dvt.instruments.device_info import DeviceInfo
 from pymobiledevice3.services.remote_server import Tap
 
 kcdata_types = {
@@ -613,8 +613,8 @@ STACKSHOT_HEADER = Int32ul.build(int(kcdata_types_enum.KCDATA_BUFFER_BEGIN_STACK
 
 
 class KdBufStream:
-    def __init__(self, channel):
-        self.channel = channel
+    def __init__(self, chunk_queue: queue.Queue):
+        self.chunk_queue = chunk_queue
         self.current_chunk = BytesIO()
 
     def tell(self):
@@ -625,7 +625,9 @@ class KdBufStream:
 
     def read(self, size):
         while size > len(self.current_chunk.getbuffer()) - self.current_chunk.tell():
-            data = self.channel.receive_message()
+            data = self.chunk_queue.get()
+            if data is None:
+                return b""
             if data.startswith(b"bplist"):
                 continue
             if data.startswith(STACKSHOT_HEADER):
@@ -691,16 +693,16 @@ class CoreProfileSessionTap(Tap):
         }
         super().__init__(dvt, self.IDENTIFIER, config)
 
-    def get_stackshot(self) -> dict:
+    async def get_stackshot(self) -> dict:
         """
         Get a stackshot from the tap.
         """
         if self.stack_shot is not None:
             # The stackshot is sent one per TAP creation, so we cache it.
             return self.stack_shot
-        data = self.channel.receive_message()
+        data = await self.channel.receive_message()
         while not data.startswith(STACKSHOT_HEADER) and not data.startswith(RAW_VERSION2_BYTES):
-            data = self.channel.receive_message()
+            data = await self.channel.receive_message()
 
         if data.startswith(RAW_VERSION2_BYTES):
             raise ExtractingStackshotError()
@@ -719,7 +721,7 @@ class CoreProfileSessionTap(Tap):
 
         return self.stack_shot
 
-    def dump(self, out: typing.BinaryIO, timeout: typing.Optional[float] = None):
+    async def dump(self, out: typing.BinaryIO, timeout: typing.Optional[float] = None):
         """
         Dump data from core profile session to a file.
         :param out: File object to write data to.
@@ -727,7 +729,7 @@ class CoreProfileSessionTap(Tap):
         """
         start = time.time()
         while timeout is None or time.time() <= start + timeout:
-            data = self.channel.receive_message()
+            data = await self.channel.receive_message()
             if data.startswith(STACKSHOT_HEADER) or data.startswith(b"bplist"):
                 # Skip not kernel trace data.
                 continue
@@ -735,11 +737,15 @@ class CoreProfileSessionTap(Tap):
             out.write(data)
             out.flush()
 
-    def get_kdbuf_stream(self):
+    async def pump_kdbuf_chunks(self, chunk_queue: queue.Queue) -> None:
+        while True:
+            chunk_queue.put(await self.channel.receive_message())
+
+    def get_kdbuf_stream(self, chunk_queue: queue.Queue):
         """
         Get kd_buf stream.
         """
-        return KdBufStream(self.channel)
+        return KdBufStream(chunk_queue)
 
     @staticmethod
     def parse_stackshot(data):
@@ -751,14 +757,16 @@ class CoreProfileSessionTap(Tap):
         return parsed_stack_shot[predefined_names[kcdata_types_enum.KCDATA_BUFFER_BEGIN_STACKSHOT]]
 
     @staticmethod
-    def get_time_config(dvt):
-        time_info = DeviceInfo(dvt).mach_time_info()
+    async def get_time_config(dvt):
+        device_info_channel = await dvt.make_channel("com.apple.instruments.server.services.deviceinfo")
+        await device_info_channel.machTimeInfo()
+        time_info = await device_info_channel.receive_plist()
         mach_absolute_time = time_info[0]
         numer = time_info[1]
         denom = time_info[2]
 
-        usecs_since_epoch = dvt.lockdown.get_value(key="TimeIntervalSince1970") * 1000000
-        timezone_ = timezone(timedelta(seconds=dvt.lockdown.get_value(key="TimeZoneOffsetFromUTC")))
+        usecs_since_epoch = dvt.lockdown.all_values.get("TimeIntervalSince1970", 0) * 1000000
+        timezone_ = timezone(timedelta(seconds=dvt.lockdown.all_values.get("TimeZoneOffsetFromUTC", 0)))
 
         return {
             "numer": numer,
@@ -767,3 +775,10 @@ class CoreProfileSessionTap(Tap):
             "usecs_since_epoch": usecs_since_epoch,
             "timezone": timezone_,
         }
+
+    @staticmethod
+    async def get_trace_codes(dvt) -> dict[int, str]:
+        device_info_channel = await dvt.make_channel("com.apple.instruments.server.services.deviceinfo")
+        await device_info_channel.traceCodesFile()
+        codes_file = await device_info_channel.receive_plist()
+        return {int(k, 16): v for k, v in (line.split() for line in codes_file.splitlines())}

@@ -12,16 +12,16 @@ class DtSimulateLocation(LockdownService, LocationSimulationBase):
         LockdownService.__init__(self, lockdown, self.SERVICE_NAME)
         LocationSimulationBase.__init__(self)
 
-    def clear(self) -> None:
+    async def clear(self) -> None:
         """stop simulation"""
-        service = self.lockdown.start_lockdown_developer_service(self.SERVICE_NAME)
-        service.sendall(struct.pack(">I", 1))
+        service = await self.lockdown.start_lockdown_developer_service(self.SERVICE_NAME)
+        await service.sendall(struct.pack(">I", 1))
 
-    def set(self, latitude: float, longitude: float) -> None:
+    async def set(self, latitude: float, longitude: float) -> None:
         """stop simulation"""
-        service = self.lockdown.start_lockdown_developer_service(self.SERVICE_NAME)
-        service.sendall(struct.pack(">I", 0))
+        service = await self.lockdown.start_lockdown_developer_service(self.SERVICE_NAME)
+        await service.sendall(struct.pack(">I", 0))
         latitude = str(latitude).encode()
         longitude = str(longitude).encode()
-        service.sendall(struct.pack(">I", len(latitude)) + latitude)
-        service.sendall(struct.pack(">I", len(longitude)) + longitude)
+        await service.sendall(struct.pack(">I", len(latitude)) + latitude)
+        await service.sendall(struct.pack(">I", len(longitude)) + longitude)

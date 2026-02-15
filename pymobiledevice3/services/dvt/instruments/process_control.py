@@ -30,40 +30,50 @@ class ProcessControl:
     IDENTIFIER = "com.apple.instruments.server.services.processcontrol"
 
     def __init__(self, dvt: DvtSecureSocketProxyService):
-        self._channel = dvt.make_channel(self.IDENTIFIER)
+        self._dvt = dvt
+        self._channel = None
 
-    def signal(self, pid: int, sig: int):
+    async def _channel_ref(self):
+        if self._channel is None:
+            self._channel = await self._dvt.make_channel(self.IDENTIFIER)
+        return self._channel
+
+    async def signal(self, pid: int, sig: int):
         """
         Send signal to process
         :param pid: PID of process to send signal.
         :param sig: SIGNAL to send
         """
-        self._channel.sendSignal_toPid_(MessageAux().append_obj(sig).append_obj(pid), expects_reply=True)
-        return self._channel.receive_plist()
+        channel = await self._channel_ref()
+        await channel.sendSignal_toPid_(MessageAux().append_obj(sig).append_obj(pid), expects_reply=True)
+        return await channel.receive_plist()
 
-    def disable_memory_limit_for_pid(self, pid: int) -> None:
+    async def disable_memory_limit_for_pid(self, pid: int) -> None:
         """
         Waive memory limit for a given pid
         :param pid: process id.
         """
-        self._channel.requestDisableMemoryLimitsForPid_(MessageAux().append_int(pid), expects_reply=True)
-        if not self._channel.receive_plist():
+        channel = await self._channel_ref()
+        await channel.requestDisableMemoryLimitsForPid_(MessageAux().append_int(pid), expects_reply=True)
+        if not await channel.receive_plist():
             raise DisableMemoryLimitError()
 
-    def kill(self, pid: int):
+    async def kill(self, pid: int):
         """
         Kill a process.
         :param pid: PID of process to kill.
         """
-        self._channel.killPid_(MessageAux().append_obj(pid), expects_reply=False)
+        channel = await self._channel_ref()
+        await channel.killPid_(MessageAux().append_obj(pid), expects_reply=False)
 
-    def process_identifier_for_bundle_identifier(self, app_bundle_identifier: str) -> int:
-        self._channel.processIdentifierForBundleIdentifier_(
+    async def process_identifier_for_bundle_identifier(self, app_bundle_identifier: str) -> int:
+        channel = await self._channel_ref()
+        await channel.processIdentifierForBundleIdentifier_(
             MessageAux().append_obj(app_bundle_identifier), expects_reply=True
         )
-        return self._channel.receive_plist()
+        return await channel.receive_plist()
 
-    def launch(
+    async def launch(
         self,
         bundle_id: str,
         arguments=None,
@@ -98,12 +108,18 @@ class ProcessControl:
             .append_obj(arguments)
             .append_obj(options)
         )
-        self._channel.launchSuspendedProcessWithDevicePath_bundleIdentifier_environment_arguments_options_(args)
-        result = self._channel.receive_plist()
+        channel = await self._channel_ref()
+        await channel.launchSuspendedProcessWithDevicePath_bundleIdentifier_environment_arguments_options_(args)
+        result = await channel.receive_plist()
         assert result
         return result
 
-    def __iter__(self) -> typing.Generator[OutputReceivedEvent, None, None]:
-        key, value = self._channel.receive_key_value()
-        if key == "outputReceived:fromProcess:atTime:":
-            yield OutputReceivedEvent.create(value)
+    async def __aiter__(self) -> typing.AsyncGenerator[OutputReceivedEvent, None]:
+        while True:
+            key, value = await self._receive_key_value()
+            if key == "outputReceived:fromProcess:atTime:":
+                yield OutputReceivedEvent.create(value)
+
+    async def _receive_key_value(self):
+        channel = await self._channel_ref()
+        return await channel.receive_key_value()

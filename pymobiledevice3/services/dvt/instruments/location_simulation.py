@@ -7,11 +7,19 @@ class LocationSimulation(LocationSimulationBase):
 
     def __init__(self, dvt):
         super().__init__()
-        self._channel = dvt.make_channel(self.IDENTIFIER)
+        self._dvt = dvt
+        self._channel = None
 
-    def set(self, latitude: float, longitude: float) -> None:
-        self._channel.simulateLocationWithLatitude_longitude_(MessageAux().append_obj(latitude).append_obj(longitude))
-        self._channel.receive_plist()
+    async def _channel_ref(self):
+        if self._channel is None:
+            self._channel = await self._dvt.make_channel(self.IDENTIFIER)
+        return self._channel
 
-    def clear(self) -> None:
-        self._channel.stopLocationSimulation()
+    async def set(self, latitude: float, longitude: float) -> None:
+        channel = await self._channel_ref()
+        await channel.simulateLocationWithLatitude_longitude_(MessageAux().append_obj(latitude).append_obj(longitude))
+        await channel.receive_plist()
+
+    async def clear(self) -> None:
+        channel = await self._channel_ref()
+        await channel.stopLocationSimulation()

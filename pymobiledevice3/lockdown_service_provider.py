@@ -27,35 +27,89 @@ class LockdownServiceProvider:
     def ecid(self) -> int:
         pass
 
-    @property
     @abstractmethod
-    def developer_mode_status(self) -> bool:
-        pass
-
-    @property
-    @abstractmethod
-    def date(self) -> datetime.datetime:
+    async def get_developer_mode_status(self) -> bool:
         pass
 
     @abstractmethod
-    def set_language(self, language: str) -> None:
+    async def get_date(self) -> datetime.datetime:
         pass
 
     @abstractmethod
-    def start_lockdown_service(self, name: str, include_escrow_bag: bool = False) -> ServiceConnection:
+    async def set_language(self, language: str) -> None:
         pass
 
     @abstractmethod
-    async def aio_start_lockdown_service(self, name: str, include_escrow_bag: bool = False) -> ServiceConnection:
+    async def get_language(self) -> str:
         pass
 
     @abstractmethod
-    def get_value(self, domain: Optional[str] = None, key: Optional[str] = None) -> Any:
+    async def set_locale(self, locale: str) -> None:
         pass
 
-    def start_lockdown_developer_service(self, name: str, include_escrow_bag: bool = False) -> ServiceConnection:
+    @abstractmethod
+    async def get_locale(self) -> str:
+        pass
+
+    @abstractmethod
+    async def set_assistive_touch(self, value: bool) -> None:
+        pass
+
+    @abstractmethod
+    async def get_assistive_touch(self) -> bool:
+        pass
+
+    @abstractmethod
+    async def set_voice_over(self, value: bool) -> None:
+        pass
+
+    @abstractmethod
+    async def get_voice_over(self) -> bool:
+        pass
+
+    @abstractmethod
+    async def set_invert_display(self, value: bool) -> None:
+        pass
+
+    @abstractmethod
+    async def get_invert_display(self) -> bool:
+        pass
+
+    @abstractmethod
+    async def set_enable_wifi_connections(self, value: bool) -> None:
+        pass
+
+    @abstractmethod
+    async def get_enable_wifi_connections(self) -> bool:
+        pass
+
+    @abstractmethod
+    async def set_timezone(self, timezone: str) -> None:
+        pass
+
+    @abstractmethod
+    async def set_uses24h_clock(self, value: bool) -> None:
+        pass
+
+    @abstractmethod
+    async def start_lockdown_service(self, name: str, include_escrow_bag: bool = False) -> ServiceConnection:
+        pass
+
+    @abstractmethod
+    async def get_value(self, domain: Optional[str] = None, key: Optional[str] = None) -> Any:
+        pass
+
+    @abstractmethod
+    async def set_value(self, value, domain: Optional[str] = None, key: Optional[str] = None) -> dict:
+        pass
+
+    @abstractmethod
+    async def remove_value(self, domain: Optional[str] = None, key: Optional[str] = None) -> dict:
+        pass
+
+    async def start_lockdown_developer_service(self, name: str, include_escrow_bag: bool = False) -> ServiceConnection:
         try:
-            return self.start_lockdown_service(name, include_escrow_bag=include_escrow_bag)
+            return await self.start_lockdown_service(name, include_escrow_bag=include_escrow_bag)
         except StartServiceError:
             logging.getLogger(self.__module__).exception(
                 "Failed to connect to required service. Make sure DeveloperDiskImage.dmg has been mounted. "
